@@ -8,7 +8,7 @@ local BOOK_ICON = "Interface\\AddOns\\EnchantBook\\EnchantBookIcon"
 local DB                       -- EnchantBookDB (saved)
 local market = {}              -- active scope and Auction House
 local linkedUntil = {}         -- recent linked profession windows (session only)
-local recipes, byId, watchedItems = {}, {}, {}   -- merged list (static data + recipes learned from scans)
+local recipes, byId, watchedItems, recipeNameCounts = {}, {}, {}, {}   -- merged list (static data + recipes learned from scans)
 local frame                    -- main window
 
 local function say(msg) print("|cff9d7cffEnchantBook|r: " .. msg) end
@@ -120,7 +120,7 @@ local function pasteInChat(text)
   try(ChatFrameUtil and ChatFrameUtil.OpenChat or ChatFrame_OpenChat, text, DEFAULT_CHAT_FRAME)
 end
 
-local function whisper(name)
+local function whisper(name, draft)
   if not chatAvailable() then return end
   if ChatFrameUtil and ChatFrameUtil.OpenChat then
     -- Set the recipient directly so slash-command autocomplete cannot split a surname.
@@ -129,10 +129,13 @@ local function whisper(name)
       box:SetTellTarget(name)
       box:SetChatType("WHISPER")
       box:UpdateHeader()
+      if draft and draft ~= "" then box:Insert(draft) end
       return true
     end) then return end
   elseif not name:find(" ", 1, true) and ChatFrame_SendTell then
     try(ChatFrame_SendTell, name, DEFAULT_CHAT_FRAME)
+    local box = try(ChatFrameUtil and ChatFrameUtil.GetActiveWindow or ChatEdit_GetActiveWindow)
+    if box and draft and try(box.GetTellTarget, box) == name then try(box.Insert, box, draft) end
     return
   end
   say("Could not open a whisper to " .. name .. ".")
@@ -142,23 +145,42 @@ end
 -- data helpers
 -----------------------------------------------------------------------
 local QUALITY_HEX = { [0]="9d9d9d", [1]="ffffff", [2]="1eff00", [3]="0070dd", [4]="a335ee", [5]="ff8000" }
+local itemDetails, itemIcons, spellIcons = {}, {}, {}
 
 local function itemName(id, noRequest)
-  local name, _, q = try(C_Item and C_Item.GetItemInfo or GetItemInfo, id)
-  local d = EnchantBook_Data.items[id] or (DB and DB.extraItems[id])
-  if not name and not d and not noRequest and C_Item and C_Item.RequestLoadItemDataByID then try(C_Item.RequestLoadItemDataByID, id) end
-  return name or (d and d[1]) or ("item:" .. id), q or (d and d[2]) or 1
+  local cached = itemDetails[id]
+  if cached then return cached[1], cached[2] end
+  local name, _, quality = try(C_Item and C_Item.GetItemInfo or GetItemInfo, id)
+  local bundled = EnchantBook_Data.items[id] or (DB and DB.extraItems[id])
+  if plain(name, "string") and name ~= "" then
+    if not plain(quality, "number") then return name, bundled and bundled[2] or 1 end
+    itemDetails[id] = {name, quality}
+    return name, quality
+  end
+  if bundled then return bundled[1], bundled[2] end
+  if not noRequest and C_Item and C_Item.RequestLoadItemDataByID then try(C_Item.RequestLoadItemDataByID, id) end
+  return "item:" .. id, 1
 end
 local function coloredItem(id)
   local n, q = itemName(id)
   return "|cff" .. (QUALITY_HEX[q] or "ffffff") .. n .. "|r"
 end
 local function itemIcon(id)
-  return try(C_Item and C_Item.GetItemIconByID or GetItemIcon, id) or 134400
+  local icon = itemIcons[id]
+  if not icon then
+    icon = try(C_Item and C_Item.GetItemIconByID or GetItemIcon, id)
+    if plain(icon, "number") or plain(icon, "string") then itemIcons[id] = icon else icon = nil end
+  end
+  return icon or 134400
 end
 local function spellIcon(r)
   if r.p then return itemIcon(r.p) end
-  return try(C_Spell and C_Spell.GetSpellTexture or GetSpellTexture, r.id) or 136244
+  local icon = spellIcons[r.id]
+  if not icon then
+    icon = try(C_Spell and C_Spell.GetSpellTexture or GetSpellTexture, r.id)
+    if plain(icon, "number") or plain(icon, "string") then spellIcons[r.id] = icon else icon = nil end
+  end
+  return icon or 136244
 end
 
 local function pasteRecipe(r)
@@ -216,6 +238,18 @@ end
 local function batchSearchAPI()
   local api = hasAuctionator()
   if api and (type(api.MultiSearchExact) == "function" or type(api.MultiSearch) == "function") then return api end
+end
+
+local function searchBatchAH(terms, advanced)
+  local api = hasAuctionator()
+  if not api then return false end
+  local function run(method, items)
+    if items and type(method) == "function" then
+      local ok, result = pcall(method, CALLER, items)
+      return ok and result ~= false
+    end
+  end
+  return run(api.MultiSearchAdvanced, advanced) or run(api.MultiSearchExact, terms) or run(api.MultiSearch, terms)
 end
 
 local function auctionHouseIsOpen()
@@ -453,12 +487,16 @@ local function priceSources(recipe, prices)
 end
 
 local function rebuild()
-  wipe(recipes); wipe(byId); wipe(watchedItems)
+  market.catalogRevision = (market.catalogRevision or 0) + 1
+  market.enchantSlots = {}
+  wipe(recipes); wipe(byId); wipe(watchedItems); wipe(recipeNameCounts)
   for _, r in ipairs(EnchantBook_Data.recipes) do recipes[#recipes + 1] = r; byId[r.id] = r end
   for id, r in pairs(DB.extra) do
     if not byId[id] then r.id = id; r.new = true; recipes[#recipes + 1] = r; byId[id] = r end
   end
   for _, r in ipairs(recipes) do
+    recipeNameCounts[r.n] = (recipeNameCounts[r.n] or 0) + 1
+    if not r.p and r.c then market.enchantSlots[r.c] = true end
     if r.f then watchedItems[r.f] = true end
     if r.p then watchedItems[r.p] = true end
     for _, rg in ipairs(r.r) do watchedItems[rg[1]] = true end
@@ -575,12 +613,10 @@ local function looksLikeEnchanting(ids)
   return false
 end
 
-local function recordRecipe(id, crafter, learned)
-  local now = time()
+local function recordRecipe(id, crafter, learned, info, now)
   if learned and crafter then
     market.contacts.seen[id] = market.contacts.seen[id] or {}
     market.contacts.seen[id][crafter] = now
-    rememberLastSeen(characterKey(crafter), now)
   end
   DB.exists[id] = true
   if not learned and not byId[id] then return false end
@@ -588,7 +624,6 @@ local function recordRecipe(id, crafter, learned)
   if byId[id] and (byId[id] ~= old or (old.n ~= "Recipe " .. id and #old.r > 0)) then return false end
   -- not in the bundled data: build an entry from the schematic
   local T = C_TradeSkillUI
-  local info = try(T.GetRecipeInfo, id) or {}
   local sch = try(T.GetRecipeSchematic, id, false)
   local rg = {}
   if sch and sch.reagentSlotSchematics then
@@ -601,7 +636,7 @@ local function recordRecipe(id, crafter, learned)
       end
     end
   end
-  local name = info.name or (sch and sch.name)
+  local name = (info and info.name) or (sch and sch.name)
   if not name or not sch or not sch.reagentSlotSchematics then return false end
   local entry = old or { g = 0, y = 0, e = "", t = "", foundBy = crafter, foundAt = now }
   entry.n = name
@@ -609,8 +644,7 @@ local function recordRecipe(id, crafter, learned)
   entry.p = sch.outputItemID ~= 0 and sch.outputItemID or nil
   entry.r, entry.ro = rg, nil
   DB.extra[id] = entry
-  if old then return false end
-  return true
+  return not old, true
 end
 
 local lastScan = 0
@@ -643,14 +677,17 @@ local function scan()
   end
   if #ids == 0 or not looksLikeEnchanting(ids) then return end
   if not linked and try(T.IsNPCCrafting) then crafter = nil end
-  local new, learnedCount = 0, 0
+  local new, learnedCount, observedAt, catalogChanged = 0, 0, time(), false
   for _, id in ipairs(ids) do
     local info = try(T.GetRecipeInfo, id)
     local learned = info and info.learned
     if learned then learnedCount = learnedCount + 1 end
-    if recordRecipe(id, crafter, learned) then new = new + 1 end
+    local added, changed = recordRecipe(id, crafter, learned, info, observedAt)
+    if added then new = new + 1 end
+    catalogChanged = catalogChanged or changed
   end
-  if new > 0 then rebuild() end
+  if crafter and learnedCount > 0 then rememberLastSeen(characterKey(crafter), observedAt) end
+  if catalogChanged then rebuild() end
   if linked and crafter and learnedCount > 0 then
     local key = characterKey(crafter)
     local untilTime = GetTime() + LINKED_ONLINE_FOR
@@ -677,7 +714,7 @@ local FILTER_GAP = 5
 local EFFECT_MAX_WIDTH, COST_WIDTH, COLUMN_GAP = 104, 96, 8
 local CATS = { "All" }
 local sorts = { "Skill", "Name", "Cost", "Slot" }
-local COLUMNS = { presenceX = 52, presenceWidth = 19, slotX = 77 }
+local COLUMNS = { presenceX = 52, presenceWidth = 19, slotX = 77, shoppingWidth = 55, bookExtraWidth = 29 }
 local equipment = {
   missingColor = { 1, 0.43, 0.43 },
   slots = {
@@ -692,7 +729,6 @@ equipment.status = {
   enchanted = { label = "Enchanted", color = { 0.50, 0.82, 0.53 } },
   empty = { label = "Empty", color = { 0.60, 0.56, 0.51 } },
   pending = { label = "Unavailable", color = { 0.60, 0.56, 0.51 } },
-  ineligible = { label = "Ineligible", color = { 0.60, 0.56, 0.51 } },
 }
 
 local function equippedEnhancement(slotID)
@@ -723,46 +759,51 @@ local function equippedEnhancement(slotID)
   return "pending"
 end
 
+local handCategories = {
+  INVTYPE_SHIELD = "Shield",
+  INVTYPE_HOLDABLE = "Off-Hand",
+  INVTYPE_2HWEAPON = "2H Weapon",
+  INVTYPE_WEAPON = "Weapon",
+  INVTYPE_WEAPONMAINHAND = "Weapon",
+  INVTYPE_WEAPONOFFHAND = "Weapon",
+}
+
 function equipment.Read()
   local gear, missing, pending = {}, {}, false
+  local supported = market.enchantSlots
+  local hasHandRecipes = supported.Weapon or supported["2H Weapon"] or supported.Shield or supported["Off-Hand"]
   local itemInfoInstant = C_Item and C_Item.GetItemInfoInstant or GetItemInfoInstant
   for i, slot in ipairs(equipment.slots) do
     local label, token = slot[1], slot[2]
-    local status, link = equippedEnhancement(try(GetInventorySlotInfo, token))
-    gear[i] = status
-    if status == "pending" then pending = true end
-    if status == "missing" then
-      if token == "RangedSlot" then
-        local _, _, _, equipLocation, _, class, subclass = try(itemInfoInstant, link)
-        if not plain(equipLocation, "string") or not plain(class, "number") or not plain(subclass, "number") then
-          gear[i], pending = "pending", true
-        elseif class == 2 and (subclass == 2 or subclass == 3 or subclass == 18) then -- bows, guns, crossbows
-          missing[label] = true
-        else
-          gear[i] = "ineligible"
-        end
-      elseif token == "MainHandSlot" or token == "SecondaryHandSlot" then
-        local _, _, _, equipLocation = try(itemInfoInstant, link)
-        if not plain(equipLocation, "string") then
-          pending = true
-        else
-          if equipLocation == "INVTYPE_SHIELD" then
-            missing.Shield = true
-          elseif equipLocation == "INVTYPE_HOLDABLE" then
-            missing["Off-Hand"] = true
-          elseif equipLocation == "INVTYPE_2HWEAPON" then
-            missing.Weapon, missing["2H Weapon"] = true, true
-          elseif equipLocation == "INVTYPE_WEAPON" or equipLocation == "INVTYPE_WEAPONMAINHAND"
-            or equipLocation == "INVTYPE_WEAPONOFFHAND" then
-            missing.Weapon = true
+    local isHand = token == "MainHandSlot" or token == "SecondaryHandSlot"
+    if supported[label] or (isHand and hasHandRecipes) then
+      local status, link = equippedEnhancement(try(GetInventorySlotInfo, token))
+      if isHand and link then
+        local _, _, _, location = try(itemInfoInstant, link)
+        if plain(location, "string") then
+          label = handCategories[location]
+          local isTwoHand = label == "2H Weapon"
+          if not (supported[label] or (isTwoHand and supported.Weapon)) then
+            status = nil
+          elseif status == "missing" and isTwoHand then
+            missing.Weapon = supported.Weapon
           end
+        else
+          status = "pending"
         end
-      else
-        missing[label] = true
       end
+      if status == "missing" and supported[label] then missing[label] = true end
+      if status == "pending" then pending = true end
+      gear[i] = status
     end
   end
   return gear, missing, pending
+end
+
+function equipment.Refresh(owner)
+  if owner.gear and not owner.gearDirty and owner.gearRevision == market.catalogRevision then return end
+  owner.gear, owner.missingSlots, owner.gearPending = equipment.Read()
+  owner.gearDirty, owner.gearRevision = nil, market.catalogRevision
 end
 
 local function recipeDisplayName(r)
@@ -773,11 +814,12 @@ local function recipeDisplayName(r)
 end
 
 local function buildCats()
+  if CATS.revision == market.catalogRevision then return end
   local seen = {}
   for _, r in ipairs(recipes) do
     if not r.p then seen[r.c] = true end
   end
-  wipe(CATS); CATS[1] = "All"
+  wipe(CATS); CATS[1], CATS.revision = "All", market.catalogRevision
   local t = {}
   for c in pairs(seen) do t[#t + 1] = c end
   table.sort(t)
@@ -847,13 +889,14 @@ local function refreshPresence()
   end
 end
 
-local function finishWho(status)
+local function finishWho(status, area)
   local request = pendingWho
   if not request then return end
   pendingWho = nil
   if request.finder then request.finder.checked[request.key] = true end
   if status then
-    whoStatus[request.key] = { status = status, expiresAt = GetTime() + WHO_VALID_FOR }
+    whoStatus[request.key] = { status = status, expiresAt = GetTime() + WHO_VALID_FOR,
+      area = plain(area, "string") and area ~= "" and area or nil }
     if status == ONLINE then rememberLastSeen(request.key, time())
     else linkedUntil[request.key] = nil end
     C_Timer.After(WHO_VALID_FOR, refreshPresence)
@@ -917,18 +960,32 @@ local function receiveWho()
     local info = try(api.GetWhoInfo, i)
     local name = plain(info, "table") and market.ContactName(info.fullName)
     if name and name:lower() == request.key then
-      finishWho(ONLINE)
+      finishWho(ONLINE, info.area)
       return
     end
   end
 end
 
-local function matchesWhoLine(message, template)
-  if not plain(template, "string") then return false end
-  local pattern = template:gsub("%%[%d]+%$([sd])", "%%%1")
-    :gsub("([%(%)%.%+%-%*%?%[%]%^%$])", "%%%1")
-    :gsub("%%s", ".-"):gsub("%%d", "%%d+")
-  return message:match("^" .. pattern .. "$") ~= nil
+local function matchWhoLine(message, template)
+  if not plain(template, "string") then return end
+  local function escape(literal)
+    return literal:gsub("([%(%)%.%+%-%*%?%[%]%^%$%%])", "%%%1")
+  end
+  local pattern, cursor, count, areaIndex, areaArgument = {}, 1, 0, nil, 0
+  for start, position, kind, stop in template:gmatch("()%%(%d*%$?)([sd])()") do
+    count = count + 1
+    pattern[#pattern + 1] = escape(template:sub(cursor, start - 1))
+    pattern[#pattern + 1] = kind == "s" and "(.-)" or "(%d+)"
+    cursor = stop
+    -- The zone is the final string argument to both stock /who formats.
+    local argument = tonumber(position:match("%d+")) or count
+    if kind == "s" and argument > areaArgument then
+      areaIndex, areaArgument = count, argument
+    end
+  end
+  pattern[#pattern + 1] = escape(template:sub(cursor))
+  local captures = { message:match("^" .. table.concat(pattern) .. "$") }
+  return captures[1] ~= nil, captures[areaIndex]
 end
 
 local function receiveWhoChat(message)
@@ -941,37 +998,54 @@ local function receiveWhoChat(message)
     return
   end
   local name = message:match("|Hplayer:([^|:]+)[^|]*|h")
-  if characterKey(market.ContactName(name)) == pendingWho.key and
-    (matchesWhoLine(message, WHO_LIST_FORMAT) or matchesWhoLine(message, WHO_LIST_GUILD_FORMAT)) then
-    finishWho(ONLINE)
-  end
+  if characterKey(market.ContactName(name)) ~= pendingWho.key then return end
+  local matched, area = matchWhoLine(message, WHO_LIST_GUILD_FORMAT)
+  if not matched then matched, area = matchWhoLine(message, WHO_LIST_FORMAT) end
+  if matched then finishWho(ONLINE, area) end
 end
 
 readPresence = function()
-  local states = {}
-  local function add(name, connected)
+  local states, areas = {}, {}
+  local function add(name, connected, area)
     name = market.ContactName(name)
     if not name or not plain(connected, "boolean") then return end
     local key = name:lower()
     if connected or not states[key] then states[key] = connected and ONLINE or OFFLINE end
+    if connected and plain(area, "string") and area ~= "" then areas[key] = area end
   end
   local function addUnit(unit)
     local faction = normalizedScopePart(try(UnitFactionGroup, unit))
     if not market.scope or (faction and faction ~= market.scope.faction) then return end
     local _, realm = try(UnitFullName, unit)
     local name = market.ContactName(unitCharacterName(unit), realm)
-    if name then add(name, try(UnitIsConnected, unit)) end
-  end
-  local friends = C_FriendList
-  for i = 1, try(friends and friends.GetNumFriends) or 0 do
-    local info = try(friends.GetFriendInfoByIndex, i)
-    if plain(info, "table") then add(info.name, info.connected) end
-  end
-  if try(IsInGuild) then
-    for i = 1, try(GetNumGuildMembers) or 0 do
-      local name, _, _, _, _, _, _, _, connected = try(GetGuildRosterInfo, i)
-      add(name, connected)
+    if not name then return end
+    local connected = try(UnitIsConnected, unit)
+    local area
+    if plain(connected, "boolean") and connected and C_Map and market.contacts.lastSeenByName[characterKey(name)] then
+      local mapID = try(C_Map.GetBestMapForUnit, unit)
+      local info = plain(mapID, "number") and try(C_Map.GetMapInfo, mapID)
+      if plain(info, "table") then area = info.name end
     end
+    add(name, connected, area)
+  end
+  if market.rosterDirty or not market.roster then
+    market.rosterDirty = nil
+    local friends = C_FriendList
+    for i = 1, try(friends and friends.GetNumFriends) or 0 do
+      local info = try(friends.GetFriendInfoByIndex, i)
+      if plain(info, "table") then add(info.name, info.connected, info.area) end
+    end
+    if try(IsInGuild) then
+      for i = 1, try(GetNumGuildMembers) or 0 do
+        local name, _, _, _, _, _, area, _, connected = try(GetGuildRosterInfo, i)
+        add(name, connected, area)
+      end
+    end
+    market.roster, market.rosterAreas = states, areas
+    states, areas = {}, {}
+  end
+  for key in pairs(market.contacts.lastSeenByName) do
+    states[key], areas[key] = market.roster[key], market.rosterAreas[key]
   end
   if try(IsInRaid) then
     for i = 1, try(GetNumGroupMembers) or 0 do addUnit("raid" .. i) end
@@ -985,7 +1059,10 @@ readPresence = function()
   local now = GetTime()
   for key, result in pairs(whoStatus) do
     if result.expiresAt <= now then whoStatus[key] = nil
-    elseif not states[key] then states[key] = result.status end
+    else
+      states[key] = states[key] or result.status
+      if states[key] == ONLINE then areas[key] = result.area or areas[key] end
+    end
   end
   local recentLinked = {}
   for key, expiresAt in pairs(linkedUntil) do
@@ -993,10 +1070,17 @@ readPresence = function()
     elseif not states[key] then states[key], recentLinked[key] = ONLINE, true end
   end
   local contactsRemoved = updateContactRetention(states)
-  return states, ownName and ownName:lower(), recentLinked, contactsRemoved
+  return states, ownName and ownName:lower(), recentLinked, contactsRemoved, areas
 end
 
-local function knownBy(id, presence)
+function market.SamePresence(old, fresh)
+  if not old then return false end
+  for key, value in pairs(fresh) do if old[key] ~= value then return false end end
+  for key in pairs(old) do if fresh[key] == nil then return false end end
+  return true
+end
+
+local function knownBy(id, presence, onlyKey, unsorted)
   local list = {}
   local byName = {}
   for who, seenAt in pairs(market.contacts.seen[id] or {}) do
@@ -1004,13 +1088,15 @@ local function knownBy(id, presence)
     if name then
       local key = name:lower()
       local previous = byName[key]
-      if not previous or seenAt > previous.seenAt or (seenAt == previous.seenAt and name < previous.name) then
+      if (not onlyKey or key == onlyKey) and
+        (not previous or seenAt > previous.seenAt or (seenAt == previous.seenAt and name < previous.name)) then
         byName[key] = { key = key, name = name, seenAt = seenAt,
           lastSeenAt = math.max(seenAt, market.contacts.lastSeenByName[key] or 0), status = presence[key] or UNKNOWN }
       end
     end
   end
   for _, crafter in pairs(byName) do list[#list + 1] = crafter end
+  if unsorted or #list < 2 then return list end
   table.sort(list, function(a, b)
     if a.status ~= b.status then return a.status < b.status end
     if a.lastSeenAt ~= b.lastSeenAt then return a.lastSeenAt > b.lastSeenAt end
@@ -1040,13 +1126,79 @@ local function recipeAvailability(id, presence)
   return false
 end
 
+ns.shoppingServices = {
+  recipe = function(id)
+    local r = byId[id]
+    if r and recipeType(r) == ENCHANT then return r end
+  end,
+  enchantName = function(r)
+    local name = r.n:gsub("^Enchant ", "")
+    if recipeNameCounts[r.n] > 1 then
+      local effect = recipeEffect(r)
+      return name .. " (" .. (effect and effect ~= "" and effect ~= "Unverified" and effect or ("skill " .. r.g)) .. ")"
+    end
+    return name
+  end,
+  bagCount = function(id)
+    local count = try(C_Item and C_Item.GetItemCount or GetItemCount, id, false)
+    if plain(count, "number") and count >= 0 then return count end
+  end,
+  knownBy = knownBy,
+  status = function(crafter)
+    return STATUS_LABELS[crafter.status] or market.LastSeenLabel(crafter.lastSeenAt)
+  end,
+  canWho = function() return whoAPI() ~= nil end,
+  whoReady = function() return not pendingWho and not whoCooldownUntil end,
+  whoWait = function()
+    if whoCooldownUntil then return math.max(1, math.ceil(whoCooldownUntil - GetTime())) end
+    if pendingWho then return "Checking…" end
+  end,
+  who = checkWho, whisper = whisper,
+  zones = function()
+    local zones = {}
+    for _, getter in pairs({GetRealZoneText, GetZoneText, GetSubZoneText}) do
+      local zone = normalizedScopePart(try(getter))
+      if zone then zones[zone] = true end
+    end
+    return zones
+  end,
+  zoneKey = normalizedScopePart,
+  canBatch = function()
+    local api = hasAuctionator()
+    return batchSearchAPI() ~= nil or (api and type(api.MultiSearchAdvanced) == "function")
+  end,
+  auctionOpen = auctionHouseIsOpen,
+  searchBatch = searchBatchAH,
+  searchNative = function(name) return try(searchNativeAH, name) end,
+  itemName = itemName, coloredItem = coloredItem, itemIcon = itemIcon, spellIcon = spellIcon,
+  unitPrice = unitPrice, money = money, costLabel = costLabel, priceSources = priceSources,
+  say = say,
+}
+
 local function makeFrame()
   local f = CreateFrame("Frame", "EnchantBookFrame", UIParent)
-  f.presence = {}
-  f:SetPoint(DB.pos and DB.pos[1] or "CENTER", UIParent, DB.pos and DB.pos[3] or "CENTER", DB.pos and DB.pos[4] or 0, DB.pos and DB.pos[5] or 0)
+  f.presence, f.missingSlots = {}, {}
+  local function contactWidthOffset(point, width)
+    if point:find("LEFT", 1, true) then return 0 end
+    if point:find("RIGHT", 1, true) then return width end
+    return width / 2
+  end
+  local function positionWindow(extraWidth)
+    local pos = DB.pos
+    local anchor = pos and pos[1] or "CENTER"
+    f:ClearAllPoints()
+    f:SetPoint(anchor, UIParent, pos and pos[3] or "CENTER",
+      (pos and pos[4] or 0) + contactWidthOffset(anchor, extraWidth), pos and pos[5] or 0)
+    f.extraWidth = extraWidth
+  end
+  positionWindow(0)
   f:SetMovable(true); f:EnableMouse(true); f:RegisterForDrag("LeftButton"); f:SetClampedToScreen(true)
   f:SetScript("OnDragStart", f.StartMoving)
-  f:SetScript("OnDragStop", function(s) s:StopMovingOrSizing(); local a, _, b, x, y = s:GetPoint(); DB.pos = { a, nil, b, x, y } end)
+  f:SetScript("OnDragStop", function(s)
+    s:StopMovingOrSizing()
+    local a, _, b, x, y = s:GetPoint()
+    if a then DB.pos = { a, nil, b, (x or 0) - contactWidthOffset(a, s.extraWidth), y or 0 } end
+  end)
   f:SetFrameStrata("HIGH")
   tinsert(UISpecialFrames, "EnchantBookFrame")
   local border = f:CreateTexture(nil, "BACKGROUND", nil, -2)
@@ -1073,8 +1225,10 @@ local function makeFrame()
   local title = version and ("EnchantBook " .. version) or "EnchantBook"
   f.TitleText:SetText(("|T%s:17:17:0:0|t  %s"):format(BOOK_ICON, title))
 
-  -- search
-  local search = CreateFrame("EditBox", nil, f, "SearchBoxTemplate")
+  local browser = CreateFrame("Frame", nil, f)
+  browser:SetAllPoints(f)
+  f.browser = browser
+  local search = CreateFrame("EditBox", nil, browser, "SearchBoxTemplate")
   search:SetHeight(24); search:SetPoint("TOPLEFT", MARGIN + 3, -34); search:SetAutoFocus(false)
   local searchPending
   search:HookScript("OnTextChanged", function()
@@ -1156,35 +1310,39 @@ local function makeFrame()
   end
 
   f.catIdx, f.sortIdx, f.recipeType = 1, 1, ENCHANT
-  local reset = control("×", f, true)
+  local reset = control("×", browser, true)
   reset:SetWidth(27)
+  reset.text:SetTextColor(1, 0.57, 0.52)
+  local resetSurface = reset:CreateTexture(nil, "BACKGROUND")
+  resetSurface:SetAllPoints()
+  resetSurface:SetColorTexture(0.39, 0.12, 0.10, 0.9)
   tooltip(reset, "Clear the search and filters")
-  local stats = control("Stats", f, true)
+  local stats = control("Stats", browser, true)
   stats:SetWidth(76)
   reset:SetPoint("RIGHT", stats, "LEFT", -FILTER_GAP, 0)
   tooltip(stats, "Show recipes that match any checked stat")
-  local gearButton = control("Gear", f, true)
+  local gearButton = control("Gear", browser, true)
   gearButton:SetWidth(69)
   stats:SetPoint("RIGHT", gearButton, "LEFT", -FILTER_GAP, 0)
   tooltip(gearButton, "Check permanent enhancements on your equipped gear")
 
-  local cat = control("All slots", f)
+  local cat = control("All slots", browser)
   cat:SetPoint("TOPLEFT", search, "BOTTOMLEFT", -3, -8)
   cat.text:SetJustifyH("LEFT")
-  local skill = control("All skills", f)
+  local skill = control("All skills", browser)
   skill:SetWidth(91)
   skill.text:SetJustifyH("LEFT")
   tooltip(skill, "Show only recipes that turn yellow within this skill bracket")
-  local kind = control("Enchants", f, true)
+  local kind = control("Enchants", browser, true)
   kind:SetWidth(110)
   tooltip(kind, "Browse enchants, crafted items or temporary buffs")
-  local filters = control("Filters", f, true)
+  local filters = control("Filters", browser, true)
   filters:SetWidth(68)
   kind:SetPoint("RIGHT", filters, "LEFT", -FILTER_GAP, 0)
   tooltip(filters, "Filter by role or show seen recipes only")
   for _, button in ipairs({ cat, skill, kind, filters, stats, gearButton }) do markDropdown(button) end
 
-  local menu = CreateFrame("Frame", nil, f)
+  local menu = CreateFrame("Frame", nil, browser)
   menu:SetFrameStrata("DIALOG")
   menu:EnableMouse(true)
   menu:Hide()
@@ -1232,14 +1390,9 @@ local function makeFrame()
     end
   end
 
-  local function openMenu(anchor, options, choose, columns, alignRight)
-    if menu:IsShown() and menu.anchor == anchor then menu:Hide(); return end
-    menu.anchor, menu.choose = anchor, choose
-    menu:ClearAllPoints()
-    local corner = alignRight and "RIGHT" or "LEFT"
-    menu:SetPoint("TOP" .. corner, anchor, "BOTTOM" .. corner, 0, -3)
+  local function populateMenu(options, columns)
     local perColumn = math.ceil(#options / columns)
-    local itemWidth = (anchor == stats or anchor == gearButton) and 176 or 151
+    local itemWidth = (menu.anchor == stats or menu.anchor == gearButton) and 176 or 151
     local itemHeight = 23
     for i, option in ipairs(options) do
       local b = menu.items[i]
@@ -1287,6 +1440,15 @@ local function makeFrame()
     end
     for i = #options + 1, #menu.items do menu.items[i]:Hide() end
     menu:SetSize(columns * itemWidth + 10, perColumn * itemHeight + 10)
+  end
+
+  local function openMenu(anchor, options, choose, columns, alignRight)
+    if menu:IsShown() and menu.anchor == anchor then menu:Hide(); return end
+    menu.anchor, menu.choose = anchor, choose
+    menu:ClearAllPoints()
+    local corner = alignRight and "RIGHT" or "LEFT"
+    menu:SetPoint("TOP" .. corner, anchor, "BOTTOM" .. corner, 0, -3)
+    populateMenu(options, columns)
     menu:Show()
   end
 
@@ -1368,15 +1530,23 @@ local function makeFrame()
       { label = "Equipped gear", heading = true },
     }
     for i, slot in ipairs(equipment.slots) do
-      options[#options + 1] = { label = slot[1], heading = true, status = equipment.status[f.gear[i]],
-        missing = (DB.highlightMissing or DB.onlyMissing) and f.gear[i] == "missing" }
+      local status = f.gear[i]
+      if status then
+        options[#options + 1] = { label = slot[1], heading = true, status = equipment.status[status],
+          missing = (DB.highlightMissing or DB.onlyMissing) and status == "missing" }
+      end
     end
     return options
   end
+  function f:UsesGear()
+    return browser:IsShown() and ((self.recipeType == ENCHANT and (DB.highlightMissing or DB.onlyMissing))
+      or (menu:IsShown() and menu.anchor == gearButton))
+  end
   gearButton:SetScript("OnClick", function(s)
+    equipment.Refresh(f)
     openMenu(s, gearOptions(), function(key) DB[key] = not DB[key] or nil end, 1, true)
   end)
-  local separator = f:CreateTexture(nil, "ARTWORK")
+  local separator = browser:CreateTexture(nil, "ARTWORK")
   separator:SetColorTexture(0.58, 0.46, 0.31, 0.32)
   separator:SetWidth(1)
 
@@ -1387,16 +1557,16 @@ local function makeFrame()
     return scroll
   end
 
-  local sf = modernScroll(f)
+  local sf = modernScroll(browser)
   sf:SetPoint("TOPLEFT", cat, "BOTTOMLEFT", 0, -31)
-  sf:SetPoint("BOTTOMLEFT", MARGIN, 30)
+  sf:SetPoint("BOTTOMLEFT", MARGIN, 58)
   local listSurface = sf:CreateTexture(nil, "BACKGROUND")
   listSurface:SetAllPoints()
   listSurface:SetColorTexture(0.087, 0.077, 0.068, 1)
   local content = CreateFrame("Frame", nil, sf); content:SetHeight(1); sf:SetScrollChild(content)
-  f.rows, f.content, f.scroll = {}, content, sf
+  f.rows, f.shoppingRows, f.content, f.scroll = {}, {}, content, sf
 
-  local head = CreateFrame("Frame", nil, f)
+  local head = CreateFrame("Frame", nil, browser)
   head:SetPoint("BOTTOMLEFT", sf, "TOPLEFT", 0, 3)
   head:SetPoint("BOTTOMRIGHT", sf, "TOPRIGHT", 0, 3)
   head:SetHeight(18)
@@ -1441,15 +1611,15 @@ local function makeFrame()
   empty:SetPoint("TOP", sf, "TOP", 0, -40)
   empty:SetText("No recipes match these filters.")
   empty:Hide()
-  f.count = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  f.count:SetPoint("BOTTOMLEFT", MARGIN, 10)
+  f.count = browser:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  f.count:SetPoint("BOTTOMLEFT", MARGIN, 38)
   f.count:SetJustifyH("LEFT")
   f.count:SetWordWrap(false)
 
   -- Keep the cost and auction actions visible while long descriptions scroll.
-  local d = CreateFrame("Frame", nil, f)
+  local d = CreateFrame("Frame", nil, browser)
   f.detail = d
-  d:SetPoint("BOTTOMRIGHT", -MARGIN, 12)
+  d:SetPoint("BOTTOMRIGHT", -MARGIN, 40)
   local detailSurface = d:CreateTexture(nil, "BACKGROUND")
   detailSurface:SetPoint("TOPLEFT", -8, 8)
   detailSurface:SetPoint("BOTTOMRIGHT", 4, -4)
@@ -1561,6 +1731,7 @@ local function makeFrame()
     row.who:SetScript("OnEnter", function(s)
       GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
       GameTooltip:SetText("Check /who for " .. row.crafter.name)
+      if row.area then GameTooltip:AddLine(row.area, 1, 1, 1, true) end
       GameTooltip:AddLine("Lookup status lasts two minutes.", 0.8, 0.8, 0.8)
       GameTooltip:Show()
     end)
@@ -1624,7 +1795,15 @@ local function makeFrame()
   d.priceSource:SetJustifyH("LEFT")
   d.priceSource:SetWordWrap(false)
 
-  local ah = control("Search mats on AH", d); ah:SetSize(154, 24)
+  d.addToShopping = control("+ Add to list", d)
+  d.addToShopping:SetSize(132, 24)
+  d.addToShopping:SetPoint("BOTTOMRIGHT", 0, 0)
+  tooltip(d.addToShopping, "Add one of this enchant to your shopping list.")
+  d.addToShopping:SetScript("OnClick", function()
+    if f.sel then f.shopping:ChangeQuantity(f.sel.id, 1) end
+  end)
+  local ah = control("Search mats", d); ah:SetSize(89, 24)
+  tooltip(ah, "Search the recipe's materials on the Auction House.")
   ah:SetPoint("BOTTOMLEFT", 0, 0)
   ah:SetScript("OnClick", function()
     if not f.sel then return end
@@ -1632,7 +1811,8 @@ local function makeFrame()
     for _, rg in ipairs(f.sel.r) do terms[#terms + 1] = (itemName(rg[1])) end
     f:SearchAH(terms)
   end)
-  local fs = control("Search formula on AH", d, true); fs:SetSize(150, 24)
+  local fs = control("Search formula", d, true); fs:SetSize(95, 24)
+  tooltip(fs, "Search the formula on the Auction House.")
   fs:SetPoint("LEFT", ah, "RIGHT", 8, 0)
   fs:SetScript("OnClick", function() if f.sel and f.sel.f then f:SearchAH({ (itemName(f.sel.f)) }) end end)
   d.ahBtn, d.fBtn = ah, fs
@@ -1641,10 +1821,7 @@ local function makeFrame()
     if not auctionHouseIsOpen() then
       say("open the auction house first, then click again."); return
     end
-    local api = batchSearchAPI()
-    if api then
-      if pcall(api.MultiSearchExact, CALLER, terms) or pcall(api.MultiSearch, CALLER, terms) then return end
-    end
+    if ns.shoppingServices.searchBatch(terms) then return end
     if #terms == 1 and try(searchNativeAH, terms[1]) then return end
     say(#terms > 1 and "Bulk search is unavailable. Click a reagent to search for it." or "Auction House search is unavailable.")
   end
@@ -1773,6 +1950,8 @@ local function makeFrame()
       row.recipeId, row.crafter = r.id, crafter
       row.name:SetText(crafter.name)
       local status = STATUS_LABELS[crafter.status] or market.LastSeenLabel(crafter.lastSeenAt)
+      row.area = self.contactAreas and self.contactAreas[crafter.key]
+      if crafter.status == ONLINE then status = status .. " · " .. (row.area or "Zone unknown") end
       if self.recentLinked[crafter.key] then status = status .. " · linked book" end
       row.status:SetText(status)
       local other = crafter.key ~= self.ownName
@@ -1789,7 +1968,7 @@ local function makeFrame()
       y = y + row:GetHeight() + 2
     end
     for i = #enchanters + 1, #d.enchanters do
-      d.enchanters[i].recipeId, d.enchanters[i].crafter = nil, nil
+      d.enchanters[i].recipeId, d.enchanters[i].crafter, d.enchanters[i].area = nil, nil, nil
       d.enchanters[i]:Hide()
     end
     body:SetHeight(math.max(1, y))
@@ -1801,18 +1980,58 @@ local function makeFrame()
     if showBatch then d.fBtn:SetPoint("LEFT", ah, "RIGHT", 8, 0)
     else d.fBtn:SetPoint("BOTTOMLEFT", d, "BOTTOMLEFT", 0, 0) end
     d.fBtn:SetShown(r.f ~= nil)
+    d.addToShopping:SetShown(recipeType(r) == ENCHANT)
+    self:UpdateShoppingCount()
   end
 
   local function updateMarker(b, presence)
     local available = recipeAvailability(b.r.id, presence)
+    if b.available == available then return end
     b.marker:SetText(available == nil and "" or (available and "|cff5be876•|r" or "|cffff6666•|r"))
     b.available = available
+  end
+
+  local function updateRowShopping(b)
+    local id, shopping = b.r.id, f.shopping
+    local quantity = shopping:IsDone(id) and 0 or shopping:Quantity(id)
+    if quantity ~= b.quickQuantity then
+      b.quickQuantity = quantity
+      if quantity > 0 and not b.quickCount then
+        local count = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        count:SetWidth(16)
+        count:SetJustifyH("CENTER")
+        count:SetTextColor(1, 0.82, 0.49)
+        count:SetPoint("RIGHT", b.quick, "LEFT", -1, 0)
+        local remove = control("", b, true)
+        remove:SetSize(16, 21)
+        remove:SetPoint("RIGHT", count, "LEFT", -1, 0)
+        local stroke = remove:CreateTexture(nil, "ARTWORK")
+        stroke:SetSize(8, 1)
+        stroke:SetPoint("CENTER")
+        stroke:SetColorTexture(0.88, 0.76, 0.57, 1)
+        remove:SetScript("OnClick", function() f.shopping:ChangeQuantity(b.r.id, -1) end)
+        tooltip(remove, "Remove one from the shopping list.")
+        b.quickCount, b.quickRemove = count, remove
+      end
+      if b.quickCount then
+        b.quickCount:SetShown(quantity > 0)
+        b.quickRemove:SetShown(quantity > 0)
+        if quantity > 0 then b.quickCount:SetText(quantity) end
+      end
+    end
+    local enabled = shopping:CanAdd(id)
+    if b.quickEnabled ~= enabled then
+      b.quickEnabled = enabled
+      b.quick:SetEnabled(enabled)
+    end
   end
 
   local function row(i)
     local b = f.rows[i]
     if b then return b end
     b = CreateFrame("Button", nil, content); b:SetHeight(ROW_H - 1)
+    b:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -(i - 1) * ROW_H)
+    b:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -(i - 1) * ROW_H)
     b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
     b.sel = b:CreateTexture(nil, "BACKGROUND"); b.sel:SetAllPoints(); b.sel:SetColorTexture(0.60, 0.44, 0.24, 0.28)
     local line = b:CreateTexture(nil, "BORDER")
@@ -1829,7 +2048,7 @@ local function makeFrame()
     b.slot:SetJustifyH("LEFT")
     b.slot:SetWordWrap(false)
     b.right = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    b.right:SetPoint("RIGHT", -8, 0); b.right:SetJustifyH("RIGHT"); b.right:SetWordWrap(false)
+    b.right:SetJustifyH("RIGHT"); b.right:SetWordWrap(false)
     b.effect = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     b.effect:SetJustifyH("LEFT")
     b.effect:SetWordWrap(false)
@@ -1838,6 +2057,18 @@ local function makeFrame()
     b.text:SetPoint("RIGHT", b.effect, "LEFT", -COLUMN_GAP, 0)
     b.text:SetJustifyH("LEFT"); b.text:SetWordWrap(false)
     if b.text.SetMaxLines then b.text:SetMaxLines(1) end
+    local quick = control("", b, true)
+    quick:SetSize(18, 21)
+    quick:SetPoint("RIGHT", -3, 0)
+    for _, shape in ipairs({{9, 1}, {1, 9}}) do
+      local stroke = quick:CreateTexture(nil, "ARTWORK")
+      stroke:SetSize(shape[1], shape[2])
+      stroke:SetPoint("CENTER")
+      stroke:SetColorTexture(0.88, 0.76, 0.57, 1)
+    end
+    quick:SetScript("OnClick", function() f.shopping:ChangeQuantity(b.r.id, 1) end)
+    tooltip(quick, "Add this enchant to your shopping list.")
+    b.quick = quick
     b:SetScript("OnEnter", function(s)
       if not s.r then return end
       GameTooltip:SetOwner(s, "ANCHOR_RIGHT")
@@ -1863,20 +2094,87 @@ local function makeFrame()
     return b
   end
 
+  local shopping = ns.CreateShoppingPane(f, control, tooltip, modernScroll, ns.shoppingServices)
+  shopping:SetPoint("TOPLEFT", f, "TOPLEFT", MARGIN, -32)
+  shopping:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -MARGIN, 37)
+  f.shopping = shopping
+
+  local tabLine = f:CreateTexture(nil, "ARTWORK")
+  tabLine:SetPoint("BOTTOMLEFT", 1, 32)
+  tabLine:SetPoint("BOTTOMRIGHT", -1, 32)
+  tabLine:SetHeight(1)
+  tabLine:SetColorTexture(0.62, 0.48, 0.32, 0.42)
+  local bookTab = control("Recipe book", f)
+  bookTab:SetSize(105, 23)
+  bookTab:SetPoint("BOTTOMLEFT", MARGIN, 5)
+  local shopTab = control("Shopping list", f)
+  shopTab:SetSize(135, 23)
+  shopTab:SetPoint("LEFT", bookTab, "RIGHT", 5, 0)
+  f.bookTab, f.shopTab = bookTab, shopTab
+
+  function f:UpdateShoppingCount()
+    local count = shopping:Count()
+    shopTab:SetText(count > 0 and ("Shopping list  (" .. count .. ")") or "Shopping list")
+    if self.sel then
+      local quantity = shopping:IsDone(self.sel.id) and 0 or shopping:Quantity(self.sel.id)
+      d.addToShopping:SetText(quantity > 0 and ("+ Add to list  (" .. quantity .. ")") or "+ Add to list")
+      d.addToShopping:SetEnabled(shopping:CanAdd(self.sel.id))
+    end
+  end
+  shopping.OnListChanged = function(_, id)
+    f:UpdateShoppingCount()
+    if not browser:IsShown() then return end
+    if id then
+      local b = f.shoppingRows[id]
+      if b then updateRowShopping(b) end
+    else
+      for _, b in pairs(f.shoppingRows) do updateRowShopping(b) end
+    end
+  end
+
+  function f:SelectTab(showShopping)
+    menu:Hide()
+    try(search.ClearFocus, search)
+    browser:SetShown(not showShopping)
+    shopping:SetShown(showShopping)
+    if showShopping then
+      bookTab.text:SetTextColor(0.76, 0.72, 0.65)
+      shopTab.text:SetTextColor(1, 0.82, 0.49)
+    else
+      bookTab.text:SetTextColor(1, 0.82, 0.49)
+      shopTab.text:SetTextColor(0.76, 0.72, 0.65)
+    end
+    self:FitToScreen()
+    self:RefreshPresence(true)
+  end
+  bookTab:SetScript("OnClick", function() f:SelectTab(false) end)
+  shopTab:SetScript("OnClick", function() f:SelectTab(true) end)
+  bookTab.text:SetTextColor(1, 0.82, 0.49)
+
   function f:FitToScreen()
     local screenW = try(UIParent.GetWidth, UIParent) or 960
     local screenH = try(UIParent.GetHeight, UIParent) or 680
     if screenW <= 24 or screenH <= 24 then screenW, screenH = 960, 680 end
     local width = math.max(900, math.min(1040, screenW - 42))
     local height = math.max(500, math.min(635, screenH - 42))
-    self:SetScale(math.min(1, (screenW - 8) / width, (screenH - 8) / height))
-    self:SetSize(width, height)
+    local windowW, windowH, extraWidth = width + COLUMNS.bookExtraWidth, height, 0
+    if shopping:IsShown() then
+      local compactWidth = math.max(430, math.floor(width * 0.44))
+      extraWidth = shopping:ExtraWidth()
+      windowW = compactWidth + extraWidth
+      shopping:Fit(compactWidth - 2 * MARGIN)
+      windowH = math.min(shopping.contentHeight, height)
+    end
+    self:SetScale(math.min(1, (screenW - 8) / windowW, (screenH - 8) / windowH))
+    self:SetSize(windowW, windowH)
+    if self.extraWidth ~= extraWidth then positionWindow(extraWidth) end
 
     local space = width - 2 * MARGIN - PANE_GAP
     local left = math.min(math.floor(space * 0.59), space - SCROLL_GUTTER - 330)
+    self.detailWidth = space - left - SCROLL_GUTTER
+    left = left + COLUMNS.bookExtraWidth
     local listW = left - SCROLL_GUTTER
     local detailX = MARGIN + left + PANE_GAP
-    self.detailWidth = space - left - SCROLL_GUTTER
     self.reagentPriceWidth = math.max(106, math.floor(self.detailWidth * 0.34))
     self.effectWidth = math.min(EFFECT_MAX_WIDTH, math.floor(listW * 0.205))
     self.slotWidth = math.min(73, math.max(64, math.floor(listW * 0.135)))
@@ -1888,7 +2186,7 @@ local function makeFrame()
     filters:SetPoint("RIGHT", cat, "LEFT", listW, 0)
     separator:ClearAllPoints()
     separator:SetPoint("TOPLEFT", MARGIN + left + PANE_GAP / 2, -33)
-    separator:SetPoint("BOTTOMLEFT", MARGIN + left + PANE_GAP / 2, 12)
+    separator:SetPoint("BOTTOMLEFT", MARGIN + left + PANE_GAP / 2, 40)
     sf:SetWidth(listW)
     content:SetWidth(listW)
     self.count:SetWidth(left)
@@ -1897,6 +2195,8 @@ local function makeFrame()
   end
 
   function f:Refresh(resetScroll)
+    self:UpdateShoppingCount()
+    if shopping:IsShown() then shopping:Refresh(); return end
     buildCats()
     if self.catIdx > #CATS then self.catIdx = 1 end
     local slot = CATS[self.catIdx]
@@ -1904,7 +2204,7 @@ local function makeFrame()
     if not canPrice and sorts[self.sortIdx] == "Cost" then self.sortIdx = 2 end
     local isEnchantTab = self.recipeType == ENCHANT
     if not isEnchantTab and sorts[self.sortIdx] == "Slot" then self.sortIdx = 2 end
-    self.gear, self.missingSlots, self.gearPending = equipment.Read()
+    if self:UsesGear() then equipment.Refresh(self) end
     local highlight = isEnchantTab and (DB.highlightMissing or DB.onlyMissing)
     local onlyMissing = isEnchantTab and DB.onlyMissing
     cat:SetShown(isEnchantTab)
@@ -1919,7 +2219,9 @@ local function makeFrame()
     kind:SetText(self.recipeType .. "s")
     local activeFilters = (DB.onlySeen and 1 or 0) + (isEnchantTab and DB.role and 1 or 0)
     filters:SetText(activeFilters > 0 and ("Filters · " .. activeFilters) or "Filters")
-    local priceColumn = canPrice and COST_WIDTH + COLUMN_GAP or 0
+    local quickWidth = isEnchantTab and COLUMNS.shoppingWidth or 0
+    local priceColumn = (canPrice and COST_WIDTH + COLUMN_GAP or 0) + quickWidth
+    sortHeaders[3]:SetPoint("RIGHT", -2 - quickWidth, 1)
     local nameX = COLUMNS.slotX + (isEnchantTab and self.slotWidth + COLUMN_GAP or 0)
     sortHeaders[4]:SetWidth(self.slotWidth)
     sortHeaders[4]:SetShown(isEnchantTab)
@@ -1999,10 +2301,7 @@ local function makeFrame()
       end
     end
     if menu:IsShown() and menu.anchor == gearButton then
-      for i, option in ipairs(gearOptions()) do
-        menu.items[i].option = option
-        showOption(menu.items[i])
-      end
+      populateMenu(gearOptions(), 1)
     end
     local s = sorts[self.sortIdx]
     local cost, missing, saved, prices = {}, {}, {}, {}
@@ -2014,11 +2313,15 @@ local function makeFrame()
       return cost[r] > 0 and 2 or 3
     end
     local desc = DB.sortDesc
+    local alpha = {}
+    if s == "Name" or s == "Slot" then
+      for _, r in ipairs(list) do alpha[r] = shortNames[r]:lower() end
+    end
     local function key(r)
       if s == "Cost" then return cost[r] end
       if s == "Skill" then return r.g or 0 end
       if s == "Slot" then return r.c end
-      return shortNames[r]:lower()
+      return alpha[r]
     end
     table.sort(list, function(a, b)
       if s == "Cost" and missing[a] and missing[b] then
@@ -2031,8 +2334,7 @@ local function makeFrame()
         return ka < kb
       end
       if s == "Slot" then
-        local nameA, nameB = shortNames[a]:lower(), shortNames[b]:lower()
-        if nameA ~= nameB then return nameA < nameB end
+        if alpha[a] ~= alpha[b] then return alpha[a] < alpha[b] end
       end
       if a.n ~= b.n then return a.n < b.n end
       return a.id < b.id
@@ -2042,28 +2344,55 @@ local function makeFrame()
       for _, r in ipairs(list) do if r == self.sel then selected = r; break end end
     end
     self:ShowRecipe(selected, prices)
+    local layout = self.rowLayout
+    if not layout or layout.nameX ~= nameX or layout.priceColumn ~= priceColumn or layout.effectWidth ~= self.effectWidth then
+      layout = {nameX = nameX, priceColumn = priceColumn, effectWidth = self.effectWidth}
+      self.rowLayout = layout
+    end
+    wipe(self.shoppingRows)
     for i, r in ipairs(list) do
       local b = row(i)
+      local firstPaint = not b.layout
+      if b.layout ~= layout then
+        b.layout = layout
+        b.quick:SetShown(isEnchantTab)
+        if not isEnchantTab and b.quickCount then
+          b.quickCount:Hide()
+          b.quickRemove:Hide()
+          b.quickQuantity = nil
+        end
+        b.slot:SetShown(isEnchantTab)
+        b.slot:SetWidth(self.slotWidth)
+        b.right:SetWidth(canPrice and COST_WIDTH or 1)
+        b.right:SetPoint("RIGHT", -8 - quickWidth, 0)
+        b.effect:SetWidth(self.effectWidth)
+        b.effect:SetPoint("RIGHT", b, "RIGHT", -COLUMN_GAP - priceColumn, 0)
+        b.text:SetPoint("LEFT", b, "LEFT", nameX, 0)
+      end
+      if b.r ~= r or b.catalogRevision ~= market.catalogRevision then
+        b.catalogRevision = market.catalogRevision
+        b.effect:SetText(effects[r])
+        b.skill:SetText((r.g or 0) > 0 and ("|cff" .. skillColor(r.g) .. r.g .. "|r") or (r.new and "|cffc1a5ffnew|r" or "—"))
+        b.slot:SetText(r.c)
+        b.text:SetText(shortNames[r])
+      end
+      local icon = spellIcon(r)
+      if b.iconID ~= icon then b.iconID = icon; b.icon:SetTexture(icon) end
+      local missingEnchant = highlight and self.missingSlots[r.c]
+      if firstPaint or b.missingEnchant ~= missingEnchant then
+        b.missingEnchant = missingEnchant
+        if missingEnchant then b.slot:SetTextColor(unpack(equipment.missingColor))
+        else b.slot:SetTextColor(0.79, 0.74, 0.67) end
+      end
+      if firstPaint or b.cost ~= cost[r] or b.missing ~= missing[r] then
+        b.right:SetText(cost[r] and costLabel(cost[r], missing[r], true) or "")
+      end
       b.r, b.cost, b.missing, b.includesSaved = r, cost[r], missing[r], saved[r]
-      b:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -(i - 1) * ROW_H)
-      b:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -(i - 1) * ROW_H)
-      b.right:SetWidth(canPrice and COST_WIDTH or 1)
-      b.effect:ClearAllPoints()
-      b.effect:SetWidth(self.effectWidth)
-      b.effect:SetPoint("RIGHT", b, "RIGHT", -COLUMN_GAP - priceColumn, 0)
-      b.effect:SetText(effects[r])
-      b.icon:SetTexture(spellIcon(r))
-      b.skill:SetText((r.g or 0) > 0 and ("|cff" .. skillColor(r.g) .. r.g .. "|r") or (r.new and "|cffc1a5ffnew|r" or "—"))
-      b.missingEnchant = highlight and self.missingSlots[r.c]
-      b.slot:SetShown(isEnchantTab)
-      b.slot:SetWidth(self.slotWidth)
-      b.slot:SetText(r.c)
-      if b.missingEnchant then b.slot:SetTextColor(unpack(equipment.missingColor))
-      else b.slot:SetTextColor(0.79, 0.74, 0.67) end
-      b.text:SetPoint("LEFT", b, "LEFT", nameX, 0)
-      b.text:SetText(shortNames[r])
+      if isEnchantTab then
+        self.shoppingRows[r.id] = b
+        updateRowShopping(b)
+      end
       updateMarker(b, self.presence)
-      b.right:SetText(cost[r] and costLabel(cost[r], missing[r], true) or "")
       b.sel:SetShown(self.sel == r)
       b:Show()
     end
@@ -2076,10 +2405,17 @@ local function makeFrame()
 
   end
 
-  function f:RefreshPresence(updateList)
-    local contactsRemoved
-    self.presence, self.ownName, self.recentLinked, contactsRemoved = readPresence()
+  function f:RefreshPresence(updateList, onlyIfChanged)
+    local states, ownName, linked, contactsRemoved, areas = readPresence()
+    if onlyIfChanged and not updateList and not contactsRemoved and self.ownName == ownName
+      and market.SamePresence(self.presence, states) and market.SamePresence(self.recentLinked, linked)
+      and market.SamePresence(self.contactAreas, areas) then return end
+    self.presence, self.ownName, self.recentLinked, self.contactAreas = states, ownName, linked, areas
     if updateList or contactsRemoved then self:Refresh(); return end
+    if shopping:IsShown() then
+      shopping:RefreshContacts()
+      return
+    end
     for _, b in ipairs(self.rows) do
       if b:IsShown() then updateMarker(b, self.presence) end
     end
@@ -2094,14 +2430,28 @@ local function makeFrame()
     try(C_GuildInfo and C_GuildInfo.GuildRoster or GuildRoster)
   end
   f.RequestGuildRoster = requestGuildRoster
+  if ns.performance then
+    f.Refresh = ns.performance.Wrap("Refresh window", f.Refresh)
+    f.ShowRecipe = ns.performance.Wrap("Show recipe", f.ShowRecipe)
+  end
   f:FitToScreen()
   f:SetScript("OnShow", function(s)
+    market.rosterDirty = true
     s:FitToScreen()
     s:RefreshPresence(true)
     requestGuildRoster()
   end)
   f:Hide()
   return f
+end
+
+if ns.performance then
+  rebuild = ns.performance.Wrap("Build catalog", rebuild)
+  scan = ns.performance.Wrap("Scan profession", scan)
+  recordAHPrices = ns.performance.Wrap("Read AH prices", recordAHPrices)
+  readPresence = ns.performance.Wrap("Read presence", readPresence)
+  equipment.Read = ns.performance.Wrap("Read gear", equipment.Read)
+  makeFrame = ns.performance.Wrap("Create window", makeFrame)
 end
 
 local function toggle()
@@ -2148,6 +2498,8 @@ ev:RegisterEvent("PLAYER_LOGIN")
 for _, e in ipairs({ "TRADE_SKILL_SHOW", "TRADE_SKILL_LIST_UPDATE", "TRADE_SKILL_DATA_SOURCE_CHANGED", "GET_ITEM_INFO_RECEIVED", "SPELL_DATA_LOAD_RESULT", "DISPLAY_SIZE_CHANGED", "UI_SCALE_CHANGED" }) do
   pcall(ev.RegisterEvent, ev, e)
 end
+pcall(ev.RegisterEvent, ev, "ZONE_CHANGED")
+pcall(ev.RegisterEvent, ev, "ZONE_CHANGED_NEW_AREA")
 for e in pairs(presenceEvents) do pcall(ev.RegisterEvent, ev, e) end
 for e in pairs(ahPriceEvents) do pcall(ev.RegisterEvent, ev, e) end
 pcall(ev.RegisterEvent, ev, "WHO_LIST_UPDATE")
@@ -2156,6 +2508,7 @@ pcall(ev.RegisterEvent, ev, "PLAYER_EQUIPMENT_CHANGED")
 pcall(ev.RegisterEvent, ev, "UNIT_INVENTORY_CHANGED")
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_SHOW")
 pcall(ev.RegisterEvent, ev, "AUCTION_HOUSE_CLOSED")
+pcall(ev.RegisterEvent, ev, "BAG_UPDATE_DELAYED")
 local dataRefreshPending = false
 local function refreshAfterData()
   if dataRefreshPending or not (frame and frame:IsShown()) then return end
@@ -2166,12 +2519,13 @@ local function refreshAfterData()
   end)
 end
 function market.Initialize(loggedIn)
+  market.rosterDirty = true
   local scope = loggedIn and market.ReadScope()
   local oldKey = market.scope and market.scope.contactKey
   if oldKey ~= (scope and scope.contactKey or nil) then
     wipe(whoStatus)
     wipe(linkedUntil)
-    pendingWho = nil
+    pendingWho, whoCooldownUntil = nil, nil
   end
   market.scope = scope or nil
   if scope then
@@ -2185,10 +2539,11 @@ function market.Initialize(loggedIn)
   market.contacts.offlineSinceByName = market.contacts.offlineSinceByName or {}
 end
 
-ev:SetScript("OnEvent", function(_, event, arg1, success)
+local function onEvent(_, event, arg1, success)
   if event == "ADDON_LOADED" and arg1 == ADDON then
     EnchantBookDB = EnchantBookDB or {}
     DB = EnchantBookDB
+    EnchantBookShopping = type(EnchantBookShopping) == "table" and EnchantBookShopping or {}
     EnchantBookAHPrices = type(EnchantBookAHPrices) == "table" and EnchantBookAHPrices or {}
     EnchantBookAHPrices.byMarket = EnchantBookAHPrices.byMarket or {}
     DB.contactScopes = DB.contactScopes or {}
@@ -2202,6 +2557,8 @@ ev:SetScript("OnEvent", function(_, event, arg1, success)
     DB.stats = DB.stats or {}
     DB.minimap = DB.minimap or {}
     rebuild()
+  elseif not DB or event == "PLAYER_LOGOUT" then
+    return
   elseif event == "PLAYER_LOGIN" then
     market.Initialize(true)
     setupMinimap()
@@ -2213,34 +2570,68 @@ ev:SetScript("OnEvent", function(_, event, arg1, success)
   elseif event == "DISPLAY_SIZE_CHANGED" or event == "UI_SCALE_CHANGED" then
     if frame and frame:IsShown() then frame:FitToScreen(); frame:Refresh() end
   elseif presenceEvents[event] then
+    local rosterEvent = event == "FRIENDLIST_UPDATE" or event == "GUILD_ROSTER_UPDATE"
+    if rosterEvent or event == "PLAYER_GUILD_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+      market.rosterDirty = true
+    end
     local scopeWasUnavailable = not market.scope
     if event == "PLAYER_ENTERING_WORLD" and scopeWasUnavailable then market.Initialize(true) end
     if frame and frame:IsShown() then
-      frame:RefreshPresence(scopeWasUnavailable and market.scope ~= nil)
+      frame:RefreshPresence(scopeWasUnavailable and market.scope ~= nil, true)
       if event == "PLAYER_GUILD_UPDATE" then frame:RequestGuildRoster() end
-    elseif event == "FRIENDLIST_UPDATE" or event == "GUILD_ROSTER_UPDATE" or next(market.contacts.offlineSinceByName) then
-      readPresence()
+    elseif rosterEvent then
+      if next(market.contacts.lastSeenByName) then readPresence() end
+    elseif next(market.contacts.offlineSinceByName) then
+      if event ~= "PLAYER_TARGET_CHANGED" or market.contacts.offlineSinceByName[characterKey(unitCharacterName("target"))] then
+        readPresence()
+      end
     end
   elseif event == "PLAYER_EQUIPMENT_CHANGED" or event == "UNIT_INVENTORY_CHANGED" then
-    if event == "PLAYER_EQUIPMENT_CHANGED" or arg1 == "player" then refreshAfterData() end
+    if frame and (event == "PLAYER_EQUIPMENT_CHANGED" or arg1 == "player") then
+      frame.gearDirty = true
+      if frame:UsesGear() then refreshAfterData() end
+    end
   elseif event == "WHO_LIST_UPDATE" then
     receiveWho()
   elseif event == "CHAT_MSG_SYSTEM" then
     receiveWhoChat(arg1)
+  elseif event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" then
+    if frame and frame:IsShown() and frame.shopping:IsShown() then
+      frame:RefreshPresence()
+    end
+  elseif event == "BAG_UPDATE_DELAYED" then
+    if frame and frame.shopping:IsShown() then refreshAfterData() end
   elseif event == "AUCTION_HOUSE_SHOW" or event == "AUCTION_HOUSE_CLOSED" then
     market.UpdateHouse(event == "AUCTION_HOUSE_SHOW")
+    if frame then frame.shopping.nativeOnly = nil end
     refreshAfterData()
   elseif ahPriceEvents[event] then
     if recordAHPrices(event, arg1) then refreshAfterData() end
   elseif event == "GET_ITEM_INFO_RECEIVED" or event == "SPELL_DATA_LOAD_RESULT" then
-    local relevant = event == "GET_ITEM_INFO_RECEIVED" and (watchedItems[arg1] or (frame and frame.gearPending))
-      or event == "SPELL_DATA_LOAD_RESULT" and byId[arg1]
-    if success ~= false and relevant then refreshAfterData() end
+    if success == false or not plain(arg1, "number") then return end
+    local relevant
+    if event == "GET_ITEM_INFO_RECEIVED" then
+      itemDetails[arg1], itemIcons[arg1] = nil, nil
+      if frame and frame.gearPending then frame.gearDirty = true end
+      relevant = watchedItems[arg1] or (frame and frame.gearPending and frame:UsesGear())
+    else
+      spellIcons[arg1] = nil
+      relevant = byId[arg1]
+    end
+    if relevant then refreshAfterData() end
   elseif event ~= "ADDON_LOADED" and DB and not pending then
     pending = true
     C_Timer.After(0.7, function() pending = false; pcall(scan) end)
   end
-end)
+end
+if ns.performance then
+  pcall(ev.RegisterEvent, ev, "PLAYER_LOGOUT")
+  ev:SetScript("OnEvent", function(self, event, ...)
+    return ns.performance.HandleEvent(onEvent, self, event, ...)
+  end)
+else
+  ev:SetScript("OnEvent", onEvent)
+end
 
 SLASH_ENCHANTBOOK1 = "/eb"
 SLASH_ENCHANTBOOK2 = "/enchantbook"
@@ -2251,5 +2642,6 @@ SlashCmdList.ENCHANTBOOK = function(msg)
     local Icon = LibStub and LibStub("LibDBIcon-1.0", true)
     if Icon then if DB.minimap.hide then Icon:Hide("EnchantBook") else Icon:Show("EnchantBook") end end
   elseif msg == "scan" then pcall(scan)
+  elseif ns.performance and (msg == "perf" or msg:sub(1, 5) == "perf ") then ns.performance.Command(msg:sub(6))
   else toggle() end
 end
