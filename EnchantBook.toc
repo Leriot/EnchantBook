@@ -1,0 +1,18 @@
+## Interface: 16001, 120105
+## Title: EnchantBook
+## Notes: Browse enchanting recipes, save material prices from the Auction House, and record recipes from enchanters' windows. /eb
+## Author: Richard Janak
+## Version: 1.6.1
+## IconTexture: Interface\AddOns\EnchantBook\EnchantBookIcon
+## Category: Professions
+## SavedVariables: EnchantBookDB
+## SavedVariablesPerCharacter: EnchantBookAHPrices
+## OptionalDeps: Auctionator
+
+Libs\LibStub\LibStub.lua
+Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+Libs\LibDataBroker-1.1\LibDataBroker-1.1.lua
+Libs\LibDBIcon-1.0\LibDBIcon-1.0.lua
+Data.lua
+Effects.lua
+EnchantBook.lua
